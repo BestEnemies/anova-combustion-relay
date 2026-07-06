@@ -1,0 +1,15 @@
+# Real device config — contains WiFi password and Anova Personal Access Token.
+# Copy sample_config.json to config.json and fill it in.
+config.json
+
+# Firmware images
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

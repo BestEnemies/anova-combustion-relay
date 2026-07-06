@@ -1,0 +1,11 @@
+{
+  "wifi_ssid": "your-2.4GHz-ssid",
+  "wifi_password": "your-wifi-password",
+  "anova_pat": "anova-your-personal-access-token",
+  "follow_oven": true,
+  "broadcast_mode": "always",
+  "broadcast_grace_min": 10,
+  "mdns_hostname": "anovaRelay",
+  "relay_probes": false,
+  "relay_connect": false
+}
