@@ -10,6 +10,7 @@ override), plus 'alarm high 150', 'sensor off', 'battery low',
 import asyncio
 import sys
 import time
+import gc
 
 import machine
 
@@ -268,7 +269,13 @@ async def background_loop(gauge, transport):
     was_connected = 0
     last_applied = None
     last_central = None
+    ticks = 0
     while True:
+        ticks += 1
+        if ticks % 30 == 0:
+            # Reclaim the per-loop garbage periodically so free heap stays in a
+            # steady band instead of drifting down until GC is forced.
+            gc.collect()
         if transport.central_state != last_central:
             log("[probe] central link: %s" % transport.central_state)
             last_central = transport.central_state
