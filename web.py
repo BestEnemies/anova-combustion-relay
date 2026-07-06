@@ -180,8 +180,13 @@ small{color:#9aa0a6}
     <label for="bO" style="margin:0">Only while oven is on (+ grace)</label></div>
   <label>Grace period after oven off <small>(minutes)</small></label>
   <input type="number" name="grace" value="__GRACE__">
-  <div class="chk"><input type="checkbox" id="relay" name="relay" __RELAY__>
-    <label for="relay" style="margin:0">MeatNet relay: repeat nearby probe advertisements</label></div>
+  <label>MeatNet relay <small>(repeat nearby probe advertisements)</small></label>
+  <div class="chk"><input type="radio" name="relay_mode" value="off" id="rmoff" __RMOFF__>
+    <label for="rmoff" style="margin:0">Off</label></div>
+  <div class="chk"><input type="radio" name="relay_mode" value="on" id="rmon" __RMON__>
+    <label for="rmon" style="margin:0">On</label></div>
+  <div class="chk"><input type="radio" name="relay_mode" value="oven" id="rmoven" __RMOVEN__>
+    <label for="rmoven" style="margin:0">Only while oven is on</label></div>
   <div class="chk"><input type="checkbox" id="connect" name="connect" __CONNECT__>
     <label for="connect" style="margin:0">MeatNet connect proxy: connect to a probe (experimental)</label></div>
   <button type="submit" name="do" value="all">Apply control</button>
@@ -258,7 +263,7 @@ function upd(s){
   ble.textContent=s.ble;serial.textContent=s.serial;ip.textContent=s.ip;
   bcast.textContent=s.broadcasting?('yes ('+s.broadcast_mode+')'):'no';
   ovon.textContent=s.oven_on?'yes':'no';
-  relayed.textContent=s.relay?(s.relayed.length?s.relayed.join(', '):'none in range'):'off';
+  relayed.textContent=s.relay?(s.relayed.length?s.relayed.join(', '):'scanning, none in range'):(s.relay_mode=='off'?'off':'idle (oven off)');
   plink.textContent=s.connect?(s.central_state+' ('+s.probe_frames+' frames)'):'off';
   heap.textContent=(s.heap/1024|0)+' KB';uptime.textContent=s.uptime+'s';
 }
@@ -334,7 +339,9 @@ class WebUI:
             "__BMA__": "checked" if self.oven["broadcast_mode"] != "oven" else "",
             "__BMO__": "checked" if self.oven["broadcast_mode"] == "oven" else "",
             "__GRACE__": str(self.oven["broadcast_grace_min"]),
-            "__RELAY__": "checked" if self.transport.relay_enabled else "",
+            "__RMOFF__": "checked" if self.oven["relay_mode"] == "off" else "",
+            "__RMON__": "checked" if self.oven["relay_mode"] == "on" else "",
+            "__RMOVEN__": "checked" if self.oven["relay_mode"] == "oven" else "",
             "__CONNECT__": "checked" if self.transport.connect_enabled else "",
             "__SSID__": _esc(self.cfg.get("wifi_ssid", "")),
             "__PASS__": _esc(self.cfg.get("wifi_password", "")),
@@ -362,6 +369,7 @@ class WebUI:
             "broadcast_mode": self.oven["broadcast_mode"],
             "oven_on": self.oven["on"],
             "relay": self.transport.relay_enabled,
+            "relay_mode": self.oven["relay_mode"],
             "relayed": self.transport.relayed_serials(),
             "connect": self.transport.connect_enabled,
             "scanning": self.transport._scanning,
@@ -500,9 +508,10 @@ class WebUI:
                     self.cfg["broadcast_grace_min"] = grace
                 except ValueError:
                     pass
-            relay = "relay" in form
-            self.transport.set_relay(relay)
-            self.cfg["relay_probes"] = relay
+            rm = form.get("relay_mode", self.oven["relay_mode"])
+            if rm in ("off", "on", "oven"):
+                self.oven["relay_mode"] = rm   # the main loop applies it
+                self.cfg["relay_probes"] = rm
             connect = "connect" in form
             self.transport.set_connect(connect)
             self.cfg["relay_connect"] = connect

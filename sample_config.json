@@ -6,6 +6,6 @@
   "broadcast_mode": "always",
   "broadcast_grace_min": 10,
   "mdns_hostname": "anovaRelay",
-  "relay_probes": false,
+  "relay_probes": "oven",
   "relay_connect": false
 }

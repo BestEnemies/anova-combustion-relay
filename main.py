@@ -59,18 +59,34 @@ oven = {
     "broadcast_mode": "always",   # "always" or "oven"
     "broadcast_grace_min": 10,    # keep broadcasting this long after off
     "broadcasting": True,         # current BLE broadcast state (display)
+    "relay_mode": "oven",         # probe relay: "off" / "on" / "oven"
 }
 
 
 def should_broadcast(now):
-    """Decide whether BLE should be broadcasting right now."""
-    if oven["broadcast_mode"] != "oven":
-        return True
+    """Decide whether the oven gate is open (oven on, or within grace)."""
     if oven["on"]:
         return True
     if oven["off_since"] is not None:
         grace = int(oven["broadcast_grace_min"]) * 60000
         return time.ticks_diff(now, oven["off_since"]) < grace
+    return False
+
+
+def should_emit_own(now):
+    """Whether our own oven-gauge advertisement should go out."""
+    if oven["broadcast_mode"] != "oven":
+        return True
+    return should_broadcast(now)
+
+
+def should_relay(now):
+    """Whether the probe relay should be active right now (tri-state)."""
+    m = oven["relay_mode"]
+    if m == "on":
+        return True
+    if m == "oven":
+        return should_broadcast(now)
     return False
 
 
@@ -285,9 +301,11 @@ async def background_loop(gauge, transport):
                 last_applied = oven["celsius"]
                 gauge.set_temperature(oven["celsius"])
         gauge.tick()
-        # The oven transmit option gates only our own gauge advertisement;
-        # the relay/proxy features keep running regardless.
-        transport.emit_own = should_broadcast(time.ticks_ms())
+        now = time.ticks_ms()
+        # The oven transmit option gates our own gauge advertisement; the
+        # relay follows its own tri-state (off / on / only-while-oven-on).
+        transport.emit_own = should_emit_own(now)
+        transport.set_relay(should_relay(now))
         transport.service()  # deferred BLE control work (advertise / MTU)
         transport.rotate_advertisement()
         oven["broadcasting"] = transport._advertising
@@ -343,9 +361,13 @@ async def amain():
     gauge = GaugeEmulator(serial=serial)
     from ble import BleTransport
     transport = BleTransport(gauge)
-    if cfg.get("relay_probes"):
-        transport.set_relay(True)
-        print("MeatNet relay: scanning for probes to repeat")
+    rp = cfg.get("relay_probes", "oven")
+    if isinstance(rp, bool):          # migrate old boolean config
+        rp = "on" if rp else "off"
+    if rp not in ("off", "on", "oven"):
+        rp = "oven"
+    oven["relay_mode"] = rp
+    print("MeatNet relay mode:", rp)
     if cfg.get("relay_connect"):
         transport.set_connect(True)
         print("MeatNet connect proxy: will connect to a probe")
