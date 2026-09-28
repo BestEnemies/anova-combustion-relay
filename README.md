@@ -7,8 +7,8 @@ An ESP32 (MicroPython) companion for the Combustion Inc. ecosystem.
 - **Exposes your Anova oven as a Gauge in the Combustion app.** The oven's
   live temperature (wet bulb in sous-vide mode, dry bulb otherwise, from the
   official Anova API) appears as a Gauge. You can even pick it as a
-  Combustion **Engine**'s control device, so the Engine regulates to the
-  oven's temperature.
+  Combustion **Engine**'s control device, so the Engine can try and fail to
+  regulate the oven's temperature.
 - **Lets you build Engine profiles, not just one temperature.** Multi-stage
   cooks where the Engine's set point changes after a set time and/or when
   the probe's virtual core temperature is reached (e.g. the built-in
@@ -155,7 +155,8 @@ open `http://anovarelay.local/` from any browser or phone on the same network
 ### Using the oven as the Engine's control device
 
 In the Combustion app you can pick the Helper's virtual gauge as the Engine's
-control device, so the Engine regulates to the **oven's** temperature. A real
+control device, so the Engine can try and fail to regulate the **oven's**
+temperature. A real
 Gauge does this by connecting *out* to the Engine and pushing its Gauge
 Status (0x60) over MeatNet UART; the Engine never connects to the gauge.
 The Helper does the same:
