@@ -1,4 +1,4 @@
-"""Tiny asyncio web UI for the Anova Oven to Combustion Relay (MicroPython).
+"""Tiny asyncio web UI for the ESP32 Combustion Helper (MicroPython).
 
 Serves a single-page config/control panel on port 80 once WiFi is up:
   GET  /         -> HTML page
@@ -104,7 +104,7 @@ def _parse_form(body):
 
 PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Anova Oven to Combustion Relay</title>
+<title>ESP32 Combustion Helper</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -133,7 +133,7 @@ small{color:#9aa0a6}
 .st small{display:block;font-size:11px;white-space:nowrap;overflow:hidden}
 .st button{margin-top:0;padding:9px 12px}
 </style></head><body><div class="wrap">
-<h1>Anova Oven &rarr; Combustion Relay</h1>
+<h1>ESP32 Combustion Helper</h1>
 <small>http://__MDNS__.local/</small>
 <div class="card">
   <div>Oven temperature

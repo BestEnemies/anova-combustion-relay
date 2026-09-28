@@ -1,24 +1,23 @@
-# Anova Oven to Combustion Relay — ESP32 (MicroPython)
+# ESP32 Combustion Helper
 
-Bridges an Anova Precision Oven's live temperature into the Combustion app by
-presenting as a Combustion Gauge-class node over BLE. 
+An ESP32 (MicroPython) companion for the Combustion Inc. ecosystem.
 
-<img src="docs/screenshots/status.png" alt="Web UI: live oven temperature and relay status" width="420" align="right">
+<img src="docs/screenshots/status.png" alt="Web UI: live oven temperature and status" width="420" align="right">
 
-What it does:
+- **Exposes your Anova oven as a Gauge in the Combustion app.** The oven's
+  live temperature (wet bulb in sous-vide mode, dry bulb otherwise, from the
+  official Anova API) appears as a Gauge. You can even pick it as a
+  Combustion **Engine**'s control device, so the Engine regulates to the
+  oven's temperature.
+- **Lets you build Engine profiles, not just one temperature.** Multi-stage
+  cooks where the Engine's set point changes after a set time and/or when
+  the probe's virtual core temperature is reached (e.g. the built-in
+  *Quicker Pulled Pork*).
+- **Also works as a MeatNet repeater.** Relays nearby probes'
+  advertisements to extend range, with an optional probe connect proxy.
 
-- **Virtual gauge:** the oven's temperature (wet bulb in sous-vide mode, dry
-  bulb otherwise, from the official Anova API) shows up in the Combustion
-  app as a Gauge.
-- **Oven as the Engine's control device:** pick the virtual gauge in the
-  Combustion app and a Combustion **Engine** regulates to the oven's
-  temperature.
-- **Engine cook profiles:** multi-stage set point changes triggered by time
-  and/or the probe's virtual core temperature (e.g. the built-in *Quicker
-  Pulled Pork*).
-- **MeatNet repeater:** relays nearby probes' advertisements, with an
-  optional probe connect proxy.
-- **Web UI** at `http://anovarelay.local/` with live status, logs and °C/°F.
+All of it is managed from a web UI at `http://anovarelay.local/` with live
+status, logs and °C/°F.
 
 The gauge serial is derived from the chip MAC.
 
@@ -155,13 +154,13 @@ open `http://anovarelay.local/` from any browser or phone on the same network
 
 ### Using the oven as the Engine's control device
 
-In the Combustion app you can pick the relay's virtual gauge as the Engine's
+In the Combustion app you can pick the Helper's virtual gauge as the Engine's
 control device, so the Engine regulates to the **oven's** temperature. A real
 Gauge does this by connecting *out* to the Engine and pushing its Gauge
 Status (0x60) over MeatNet UART; the Engine never connects to the gauge.
-The relay does the same:
+The Helper does the same:
 
-- It's automatic: the relay checks the Engine's control device, and while
+- It's automatic: the Helper checks the Engine's control device, and while
   it's this gauge, holds a link to the Engine and sends the gauge status
   every second. Choose another control device in the app to stop it. The
   web UI's "Oven → Engine" line shows what it's doing.
@@ -176,7 +175,7 @@ If the oven is cold and the set point is high, the fan runs flat out.
 
 ### Combustion Engine cook profiles
 
-The relay can drive a **Combustion Engine**'s set point through a multi-stage
+The Helper can drive a **Combustion Engine**'s set point through a multi-stage
 cook profile. Each stage sets the Engine, then moves on when **any** of its
 triggers fires:
 
@@ -211,7 +210,7 @@ How it works:
 - The Engine's set point and the probe's core temperature are read
   **passively from BLE advertisements** (the probe's own, or repeated by the
   Engine/other nodes). Unless the oven is the Engine's control device (see
-  above), the relay only connects to the Engine while it's changing the set
+  above), the Helper only connects to the Engine while it's changing the set
   point, then disconnects after ~15 s, so it doesn't hold one of the
   Engine's connection slots or the probe's.
 - Changes are sent the way the official app does it: send, re-send every 5 s,
@@ -241,5 +240,5 @@ Set in the web UI Control section (persisted as `relay_probes`): **Off**,
 **On**, or **Only while oven is on** (default). When active, the device scans for nearby Combustion **probes** advertising
 directly (product type 1) and re-broadcasts each one as a repeated MeatNet
 **node** advertisement (product type 2) with the hop-count byte set, so the
-probe's live temperature reaches the app *through* this relay when the probe
+probe's live temperature reaches the app *through* the Helper when the probe
 is out of the phone's range. 

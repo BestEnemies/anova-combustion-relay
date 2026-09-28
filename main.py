@@ -1,4 +1,4 @@
-"""Anova Oven to Combustion Relay for ESP32 (MicroPython).
+"""ESP32 Combustion Helper (MicroPython).
 
 Starts automatically on boot. Connect a serial terminal (e.g.
 `mpremote repl` or PuTTY at 115200) and type a temperature.
@@ -420,7 +420,7 @@ async def amain():
         except Exception as exc:
             sys.print_exception(exc)
             print("Engine control failed to start:", exc)
-    print("\nAnova Oven to Combustion Relay on ESP32")
+    print("\nESP32 Combustion Helper")
     print("Serial: %s  |  advertising 0x09C7 + DFU FE59 scan response" %
           gauge.serial)
     if cfg.get("wifi_ssid"):

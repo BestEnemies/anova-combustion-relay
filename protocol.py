@@ -1,4 +1,4 @@
-"""Combustion Gauge BLE protocol (MicroPython) - Anova Oven to Combustion Relay.
+"""Combustion Gauge BLE protocol (MicroPython) - ESP32 Combustion Helper.
 
 Wire formats for the Combustion BLE protocol, written for MicroPython
 (no dataclasses/typing/enum).
