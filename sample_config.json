@@ -7,5 +7,8 @@
   "broadcast_grace_min": 10,
   "mdns_hostname": "anovaRelay",
   "relay_probes": "oven",
-  "relay_connect": false
+  "relay_connect": false,
+  "engine_enabled": true,
+  "engine_serial": "",
+  "profile_probe": ""
 }

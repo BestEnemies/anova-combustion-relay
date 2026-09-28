@@ -127,6 +127,18 @@ def start_anova_bridge(cfg):
             oven["status"] = "wifi failed"
             return
         oven["status"] = "wifi ok, starting anova"
+        # Wall-clock time lets a cook profile resume correctly after a reboot.
+        try:
+            import ntptime
+            for _ in range(5):
+                try:
+                    ntptime.settime()
+                    log("[time] clock synced via NTP")
+                    break
+                except Exception:
+                    time.sleep(3)
+        except ImportError:
+            pass
 
         import anova
 
@@ -281,10 +293,30 @@ def _hex(b):
     return " ".join("%02x" % x for x in b)
 
 
-async def background_loop(gauge, transport):
+async def ble_loop(transport, engine):
+    """Fast loop for BLE central work: each link step (connect, discover,
+    write) takes one service() call, so run it at 10 Hz."""
+    last = {}
+    while True:
+        transport.service()
+        if engine:
+            # Only feed the Engine while our gauge is "on" (advertising).
+            engine.feed_allowed = transport.emit_own
+            try:
+                engine.service()
+            except Exception as exc:
+                log("[engine] error: %s" % exc)
+        for link in transport.links:
+            if last.get(link.name) != link.state:
+                last[link.name] = link.state
+                if link.name != "engine" or link.enabled or link.state != "idle":
+                    log("[%s] central link: %s" % (link.name, link.state))
+        await asyncio.sleep_ms(100)
+
+
+async def background_loop(gauge, transport, runner=None):
     was_connected = 0
     last_applied = None
-    last_central = None
     ticks = 0
     while True:
         ticks += 1
@@ -292,9 +324,11 @@ async def background_loop(gauge, transport):
             # Reclaim the per-loop garbage periodically so free heap stays in a
             # steady band instead of drifting down until GC is forced.
             gc.collect()
-        if transport.central_state != last_central:
-            log("[probe] central link: %s" % transport.central_state)
-            last_central = transport.central_state
+        if runner:
+            try:
+                runner.service()
+            except Exception as exc:
+                log("[profile] error: %s" % exc)
         # Apply the latest oven temperature to the gauge (if following).
         if oven["follow"] and oven["celsius"] is not None:
             if oven["celsius"] != last_applied:
@@ -306,7 +340,6 @@ async def background_loop(gauge, transport):
         # relay follows its own tri-state (off / on / only-while-oven-on).
         transport.emit_own = should_emit_own(now)
         transport.set_relay(should_relay(now))
-        transport.service()  # deferred BLE control work (advertise / MTU)
         transport.rotate_advertisement()
         oven["broadcasting"] = transport._advertising
         n = len(transport.connections)
@@ -371,6 +404,22 @@ async def amain():
     if cfg.get("relay_connect"):
         transport.set_connect(True)
         print("MeatNet connect proxy: will connect to a probe")
+    engine = runner = store = None
+    if cfg.get("engine_enabled", True):
+        try:
+            from engine import EngineController
+            from profiles import ProfileStore, ProfileRunner
+            engine = EngineController(transport, log, cfg.get("engine_serial", ""))
+            engine.set_enabled(True)
+            # Stream our gauge status to the Engine when it uses us as its
+            # control device (a real Gauge pushes 0x60 to the Engine).
+            engine.configure_feed(gauge.serial, gauge.status_notification)
+            store = ProfileStore()
+            runner = ProfileRunner(engine, log, cfg.get("profile_probe", ""))
+            print("Engine control: on (%d cook profiles)" % len(store.profiles))
+        except Exception as exc:
+            sys.print_exception(exc)
+            print("Engine control failed to start:", exc)
     print("\nAnova Oven to Combustion Relay on ESP32")
     print("Serial: %s  |  advertising 0x09C7 + DFU FE59 scan response" %
           gauge.serial)
@@ -384,11 +433,13 @@ async def amain():
         print("Anova bridge: no WiFi in config.json (manual temps only)")
     print("Type a temperature in C (e.g. 110) or 'help'.\n")
     console = Console(gauge, transport)
-    tasks = [background_loop(gauge, transport), console_loop(console)]
+    tasks = [ble_loop(transport, engine),
+             background_loop(gauge, transport, runner), console_loop(console)]
     if cfg.get("wifi_ssid"):
         try:
             from web import WebUI
-            tasks.append(WebUI(gauge, oven, transport, cfg, log_state=_log).run())
+            tasks.append(WebUI(gauge, oven, transport, cfg, log_state=_log,
+                               engine=engine, runner=runner, store=store).run())
         except Exception as exc:
             print("Web UI failed to start:", exc)
     await asyncio.gather(*tasks)

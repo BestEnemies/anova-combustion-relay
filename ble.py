@@ -11,6 +11,7 @@ import bluetooth
 import struct
 
 import protocol
+from central import CentralLink
 
 import time
 
@@ -27,6 +28,7 @@ _IRQ_GATTC_CHARACTERISTIC_RESULT = 11
 _IRQ_GATTC_CHARACTERISTIC_DONE = 12
 _IRQ_GATTC_DESCRIPTOR_RESULT = 13
 _IRQ_GATTC_DESCRIPTOR_DONE = 14
+_IRQ_GATTC_WRITE_DONE = 17
 _IRQ_GATTC_NOTIFY = 18
 _IRQ_MTU_EXCHANGED = 21
 
@@ -92,6 +94,7 @@ class BleTransport:
         self.ble.gatts_set_buffer(self._rx_handle, 256, True)
 
         self.connections = set()
+        self.client_addr = {}  # conn_handle -> peer address (diagnostics)
         self.conn_mtu = {}  # conn_handle -> negotiated ATT MTU (default 23)
         self.rx_queue = []  # written payloads, drained by the main loop
         self._last_adv = None
@@ -110,49 +113,73 @@ class BleTransport:
         self._probe_addr = {}  # serial bytes -> (addr_type, addr bytes)
         self._adv_index = 0
         self._scanning = False
-        # Central role (connect to a probe) - the #2 connection proxy.
+        # Outbound (central-role) links. The probe link is the #2 connect
+        # proxy (Probe Status service); the engine link talks MeatNet UART to
+        # a Combustion Engine to change its set point.
         self.connect_enabled = False
-        self.central_state = "idle"   # idle/connecting/discovering/ready
-        self._central_conn = None
-        self._central_action = None
-        self._central_svc = None      # (start, end) handle range
-        self._probe_tx = None         # notify (TX) value handle on the probe
-        self._probe_rx = None         # write (RX) value handle on the probe
-        self._probe_cccd = None
-        self._central_target = None   # (addr_type, addr) to connect to
-        self._central_serial = None   # serial bytes of the connected probe
-        self._connect_started = None  # ticks_ms when the connect attempt began
-        self.probe_frames = []        # frames received from the probe
-        self.probe_frame_count = 0
+        self.probe_link = CentralLink(self.ble, "probe", _PROBE_STATUS_SVC,
+                                      _PROBE_STATUS_CHAR, keep=8)
+        self.engine_link = CentralLink(self.ble, "engine",
+                                       protocol.UART_SERVICE_UUID,
+                                       protocol.UART_TX_CHAR_UUID,
+                                       protocol.UART_RX_CHAR_UUID, keep=64,
+                                       write_mode=0)
+        self.links = (self.probe_link, self.engine_link)
+        # Passive-scan observations, stored raw in the IRQ, decoded on demand.
+        self.scan_for_engine = False
+        self.engines = {}     # serial10 -> (body, ticks, addr_type, addr, rssi)
+        self.probe_raw = {}   # serial4 -> (body, ticks, product type)
+        self.mtu_events = []  # diagnostics: (conn, mtu, link name)
         self._advertise()
 
-    # -- central role (connect to a probe) -----------------------------------
+    # -- central links ------------------------------------------------------
+
+    @property
+    def central_state(self):
+        return self.probe_link.state
+
+    @property
+    def probe_frame_count(self):
+        return self.probe_link.count
+
+    @property
+    def probe_frames(self):
+        return self.probe_link.frames
 
     def set_connect(self, enabled):
         self.connect_enabled = enabled
+        self.probe_link.enabled = enabled
         self._update_scan()   # scanning finds the probe's address
-        if not enabled and self._central_conn is not None:
-            try:
-                self.ble.gap_disconnect(self._central_conn)
-            except OSError:
-                pass
 
-    def _maybe_connect_probe(self):
-        """If we know a probe's address and aren't connected, start connecting."""
-        if (not self.connect_enabled or self._central_conn is not None
-                or self.central_state != "idle" or self._central_action):
-            return
-        for serial, target in self._probe_addr.items():
-            self._central_target = target
-            self._central_serial = serial
-            self._central_action = "connect"
-            return
+    def set_engine_scan(self, enabled):
+        self.scan_for_engine = enabled
+        self._update_scan()
+
+    def _link_for_conn(self, conn):
+        for link in self.links:
+            if link.conn == conn:
+                return link
+        return None
+
+    def _link_connecting(self, addr):
+        for link in self.links:
+            if (link.state == "connecting" and link.target
+                    and link.target[1] == addr):
+                return link
+        for link in self.links:
+            if link.state == "connecting":
+                return link
+        return None
 
     # -- MeatNet relay -------------------------------------------------------
 
+    def _scan_wanted(self):
+        return self.relay_enabled or self.connect_enabled or self.scan_for_engine
+
     def _update_scan(self):
-        # Scan whenever relaying or proxying - independent of advertising.
-        if self.relay_enabled or self.connect_enabled:
+        # Scan whenever relaying, proxying or managing an Engine - independent
+        # of advertising.
+        if self._scan_wanted():
             self._start_scan()
         else:
             self._stop_scan()
@@ -185,8 +212,12 @@ class BleTransport:
             pass
         self._scanning = False
 
-    def _scan_ingest(self, payload, addr_type=None, addr=None):
-        """Parse a scanned advertisement; store direct-probe (type 1) data."""
+    def _scan_ingest(self, payload, addr_type=None, addr=None, rssi=0):
+        """Parse a scanned advertisement and record Combustion devices.
+
+        Runs in the IRQ, so it only slices bytes and stores them; decoding
+        happens later on the main loop.
+        """
         i = 0
         n = len(payload)
         while i + 1 < n:
@@ -196,13 +227,24 @@ class BleTransport:
             ad_type = payload[i + 1]
             if ad_type == 0xFF and length >= 4:
                 ad = payload[i + 2:i + 1 + length]
-                if ad[:2] == _VENDOR_LE:
-                    body = ad[2:]
-                    if body and body[0] == _PRODUCT_TYPE_PROBE and len(body) >= 5:
-                        serial = bytes(body[1:5])
-                        self.repeated[serial] = (bytes(body), time.ticks_ms())
+                if ad[:2] == _VENDOR_LE and len(ad) > 2:
+                    body = bytes(ad[2:])
+                    ptype = body[0]
+                    now = time.ticks_ms()
+                    if ptype == _PRODUCT_TYPE_PROBE and len(body) >= 5:
+                        serial = body[1:5]
+                        self.repeated[serial] = (body, now)
                         if addr is not None:
                             self._probe_addr[serial] = (addr_type, bytes(addr))
+                    # Probe readings, direct (1) or repeated by a node (2).
+                    if ptype in (1, 2) and len(body) >= 20:
+                        serial = body[1:5]
+                        if serial != b"\x00\x00\x00\x00":
+                            self.probe_raw[serial] = (body, now, ptype)
+                    elif ptype == protocol.PRODUCT_TYPE_ENGINE and len(body) >= 15 \
+                            and addr is not None:
+                        self.engines[body[1:11]] = (body, now, addr_type,
+                                                    bytes(addr), rssi)
             i += 1 + length
 
     def _repeat_payload(self, body):
@@ -298,71 +340,86 @@ class BleTransport:
         # calls to service() on the main loop. Calling gap/gatts APIs here
         # panics the interrupt watchdog when WiFi is also running.
         if event == _IRQ_CENTRAL_CONNECT:
-            conn_handle, _, _ = data
+            conn_handle, _, addr = data
             self.connections.add(conn_handle)
+            self.client_addr[conn_handle] = bytes(addr)
             self.conn_mtu[conn_handle] = 23
             self._pending_mtu.append(conn_handle)
             self._need_advertise = True
         elif event == _IRQ_SCAN_RESULT:
             # (addr_type, addr, adv_type, rssi, adv_data). Parse bytes only -
             # no BLE stack calls in the IRQ.
-            addr_type, addr, _, _, adv_data = data
-            self._scan_ingest(bytes(adv_data), addr_type, bytes(addr))
+            addr_type, addr, _, rssi, adv_data = data
+            self._scan_ingest(bytes(adv_data), addr_type, bytes(addr), rssi)
         elif event == _IRQ_SCAN_DONE:
             # The scan stopped (often because gap_connect pre-empted it).
-            # service() re-arms it if relaying/proxying is still enabled.
+            # service() re-arms it if it is still wanted.
             self._scanning = False
         elif event == _IRQ_PERIPHERAL_CONNECT:
-            conn_handle, _, _ = data
-            self._central_conn = conn_handle
-            self._connect_started = None
-            self.central_state = "discovering"
-            self._central_action = "discover_svc"
+            conn_handle, _, addr = data
+            link = self._link_connecting(bytes(addr))
+            if link:
+                link.on_connect(conn_handle)
+                # The peer often starts the MTU exchange straight away, and
+                # its event can arrive before this one - apply it now.
+                mtu = self.conn_mtu.pop(conn_handle, None)
+                if mtu:
+                    link.on_mtu(mtu)
         elif event == _IRQ_PERIPHERAL_DISCONNECT:
-            conn_handle, _, _ = data
-            if conn_handle == self._central_conn:
-                self._central_conn = None
-                self.central_state = "idle"
-                self._probe_tx = self._probe_rx = self._probe_cccd = None
+            self.conn_mtu.pop(data[0], None)
+            link = self._link_for_conn(data[0])
+            if link:
+                link.on_disconnect()
         elif event == _IRQ_GATTC_SERVICE_RESULT:
             conn_handle, start, end, uuid = data
-            if conn_handle == self._central_conn and \
-                    uuid == _uuid128(_PROBE_STATUS_SVC):
-                self._central_svc = (start, end)
+            link = self._link_for_conn(conn_handle)
+            if link:
+                link.on_service(start, end, uuid)
         elif event == _IRQ_GATTC_SERVICE_DONE:
-            if self._central_svc:
-                self._central_action = "discover_char"
+            link = self._link_for_conn(data[0])
+            if link:
+                link.on_service_done()
         elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
-            conn_handle, end_handle, value_handle, properties, uuid = data
-            if conn_handle == self._central_conn:
-                if uuid == _uuid128(_PROBE_STATUS_CHAR):
-                    self._probe_tx = value_handle  # notify source
+            conn_handle, _, value_handle, _, uuid = data
+            link = self._link_for_conn(conn_handle)
+            if link:
+                link.on_char(value_handle, uuid)
         elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
-            if self._probe_tx is not None:
-                self._central_action = "discover_desc"
+            link = self._link_for_conn(data[0])
+            if link:
+                link.on_char_done()
         elif event == _IRQ_GATTC_DESCRIPTOR_RESULT:
             conn_handle, dsc_handle, uuid = data
-            # CCCD (0x2902) above the TX characteristic value handle.
-            if (conn_handle == self._central_conn and self._probe_cccd is None
-                    and self._probe_tx is not None
-                    and dsc_handle > self._probe_tx
-                    and uuid == bluetooth.UUID(0x2902)):
-                self._probe_cccd = dsc_handle
+            link = self._link_for_conn(conn_handle)
+            if link:
+                link.on_desc(dsc_handle, uuid)
         elif event == _IRQ_GATTC_DESCRIPTOR_DONE:
-            self._central_action = "enable_notify"
+            link = self._link_for_conn(data[0])
+            if link:
+                link.on_desc_done()
+        elif event == _IRQ_GATTC_WRITE_DONE:
+            link = self._link_for_conn(data[0])
+            if link:
+                link.on_write_done()
         elif event == _IRQ_GATTC_NOTIFY:
-            conn_handle, value_handle, notify_data = data
-            if conn_handle == self._central_conn:
-                self.probe_frames.append(bytes(notify_data))
-                self.probe_frame_count += 1
-                if len(self.probe_frames) > 8:
-                    self.probe_frames.pop(0)
+            conn_handle, _, notify_data = data
+            link = self._link_for_conn(conn_handle)
+            if link:
+                link.on_notify(notify_data)
         elif event == _IRQ_MTU_EXCHANGED:
             conn_handle, mtu = data
-            self.conn_mtu[conn_handle] = mtu
+            link = self._link_for_conn(conn_handle)
+            self.mtu_events.append((conn_handle, mtu, link.name if link else None))
+            if len(self.mtu_events) > 8:
+                self.mtu_events.pop(0)
+            if link:
+                link.on_mtu(mtu)
+            else:
+                self.conn_mtu[conn_handle] = mtu
         elif event == _IRQ_CENTRAL_DISCONNECT:
             conn_handle, _, _ = data
             self.connections.discard(conn_handle)
+            self.client_addr.pop(conn_handle, None)
             self.conn_mtu.pop(conn_handle, None)
             self._need_advertise = True
         elif event == _IRQ_GATTS_WRITE:
@@ -384,82 +441,37 @@ class BleTransport:
             self._need_advertise = False
             # Re-establish advertising after a connect/disconnect.
             self.rotate_advertisement()
+        # #2 connect proxy: pick a probe we've heard advertising directly.
+        link = self.probe_link
+        if (self.connect_enabled and link.state == "idle" and link.conn is None
+                and link.action is None):
+            for serial, (addr_type, addr) in self._probe_addr.items():
+                if link.target != (addr_type, addr):
+                    link.set_target(addr_type, addr, serial)
+                break
+        # Only one outstanding gap_connect at a time across all links.
+        may_connect = not any(l.state == "connecting" for l in self.links)
+        for link in self.links:
+            link.service(may_connect)
+            if link.state == "connecting":
+                may_connect = False
         # Re-arm the scan if it should be running but was stopped (e.g. a
         # gap_connect pre-empted it). Not during an active connect attempt.
-        if ((self.relay_enabled or self.connect_enabled) and not self._scanning
-                and self.central_state != "connecting"):
+        if self._scan_wanted() and not self._scanning and may_connect:
             self._start_scan()
-        self._service_central()
-
-    def _service_central(self):
-        """Drive the deferred central-role (connect-to-probe) state machine."""
-        # Abandon a connection attempt that never completes (e.g. the probe
-        # is still holding a stale link) and retry.
-        if (self.central_state == "connecting" and self._connect_started and
-                time.ticks_diff(time.ticks_ms(), self._connect_started) > 12000):
-            try:
-                self.ble.gap_connect(None)  # cancel outstanding attempt
-            except OSError:
-                pass
-            self.central_state = "idle"
-            self._central_conn = None
-            self._connect_started = None
-        if self.connect_enabled:
-            self._maybe_connect_probe()
-        action = self._central_action
-        if not action:
-            return
-        self._central_action = None
-        try:
-            if action == "connect":
-                addr_type, addr = self._central_target
-                self.central_state = "connecting"
-                self._connect_started = time.ticks_ms()
-                self.ble.gap_connect(addr_type, addr)
-            elif action == "discover_svc":
-                self.ble.gattc_discover_services(
-                    self._central_conn, _uuid128(_PROBE_STATUS_SVC))
-            elif action == "discover_char":
-                start, end = self._central_svc
-                self.ble.gattc_discover_characteristics(
-                    self._central_conn, start, end)
-            elif action == "discover_desc":
-                start, end = self._central_svc
-                self.ble.gattc_discover_descriptors(
-                    self._central_conn, self._probe_tx, end)
-            elif action == "enable_notify":
-                if self._probe_cccd is not None:
-                    self.ble.gattc_write(self._central_conn, self._probe_cccd,
-                                         b"\x01\x00", 1)
-                self.central_state = "ready"
-        except OSError as exc:
-            self.central_state = "error: %s" % exc
-
-    def probe_send(self, frame):
-        """Write a UART frame to the connected probe (RX characteristic)."""
-        if self._central_conn is None or self._probe_rx is None:
-            return False
-        try:
-            self.ble.gattc_write(self._central_conn, self._probe_rx, frame, 1)
-            return True
-        except OSError:
-            return False
-
-    def poll_probe_frames(self):
-        frames, self.probe_frames = self.probe_frames, []
-        return frames
 
     def connected_probe_serials(self):
         """Serials (4 bytes LE) of probes we have a live central link to."""
-        if self.central_state == "ready" and self._central_serial:
-            return [self._central_serial]
+        if self.probe_link.ready and self.probe_link.key:
+            return [self.probe_link.key]
         return []
 
     def latest_probe_status(self):
         """(serial_bytes, 94-byte status) for the connected probe, or None."""
-        if (self.central_state == "ready" and self._central_serial
-                and self.probe_frames and len(self.probe_frames[-1]) == 94):
-            return self._central_serial, self.probe_frames[-1]
+        link = self.probe_link
+        if (link.ready and link.key and link.frames
+                and len(link.frames[-1]) == 94):
+            return link.key, link.frames[-1]
         return None
 
     # -- I/O ----------------------------------------------------------------

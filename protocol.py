@@ -8,7 +8,10 @@ import random
 import struct
 
 VENDOR_ID = 0x09C7
+PRODUCT_TYPE_PROBE = 1
+PRODUCT_TYPE_NODE = 2
 PRODUCT_TYPE_GAUGE = 3
+PRODUCT_TYPE_ENGINE = 6
 
 UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -29,7 +32,17 @@ MSG_READ_NODE_LIST = 0x42
 MSG_READ_NETWORK_TOPOLOGY = 0x43
 MSG_READ_PROBE_LIST = 0x44
 MSG_PROBE_STATUS = 0x45
+# Combustion Engine (engine_ble_specification.rst)
+MSG_ENGINE_STATUS = 0x70
+MSG_SET_ENGINE_SETPOINT = 0x71
 RESPONSE_FLAG = 0x80
+
+ENGINE_SETPOINT_MIN_C = 0.0
+ENGINE_SETPOINT_MAX_C = 575.0
+
+# Probe "Mode" (low 2 bits of the Mode/ID byte)
+PROBE_MODE_NORMAL = 0
+PROBE_MODE_INSTANT_READ = 1
 
 MIN_TEMP_C = -20.0
 MAX_TEMP_C = 799.0
@@ -254,3 +267,176 @@ def build_read_logs_response(serial, request_id, sequence, temperature_c,
         1 if sensor_present else 0,
     )
     return build_response(MSG_READ_GAUGE_LOGS, request_id, True, payload)
+
+
+# ---------------------------------------------------------------------------
+# Combustion Engine
+# ---------------------------------------------------------------------------
+
+def encode_engine_setpoint(celsius):
+    """Engine set point: 13-bit, 0.1 C steps, -20 C offset, clamped 0..575."""
+    c = max(ENGINE_SETPOINT_MIN_C, min(ENGINE_SETPOINT_MAX_C, celsius))
+    return round((c + 20.0) / 0.1) & 0x1FFF
+
+
+def build_set_engine_setpoint(serial10, celsius, request_id=None):
+    """Set Engine Temperature Set Point (0x71): serial(10) + set point(2)."""
+    s = bytes(serial10[:10])
+    s = s + b"\x00" * (10 - len(s))
+    payload = s + struct.pack("<H", encode_engine_setpoint(celsius))
+    return build_request(MSG_SET_ENGINE_SETPOINT, payload, request_id)
+
+
+def parse_engine_advert(body):
+    """Engine manufacturer data (after the company ID), product type 6.
+
+    [0] type, [1:11] serial, [11:13] set point, [13] status flags,
+    [14] preferences.
+    """
+    if len(body) < 15 or body[0] != PRODUCT_TYPE_ENGINE:
+        return None
+    flags = body[13]
+    return {
+        "serial": bytes(body[1:11]),
+        "setpoint_c": decode_raw_temperature(struct.unpack_from("<H", body, 11)[0]),
+        "app_mode": bool(flags & 0x01),
+        "ctrl_connected": bool(flags & 0x02),
+        "lid_open": bool(flags & 0x04),
+        "fixed_speed": bool(flags & 0x08),
+    }
+
+
+def parse_engine_status(payload):
+    """Engine Status (0x70) notification payload -> dict, or None.
+
+    Offsets below are relative to the end of the 10-byte serial, matching the
+    official Android framework's EngineStatus parser.
+    """
+    if len(payload) < 10 + 61:
+        return None
+    p = payload[10:]
+    flags = p[34]
+    return {
+        "serial": bytes(payload[0:10]),
+        "setpoint_c": decode_raw_temperature(struct.unpack_from("<H", p, 17)[0]),
+        "control_c": decode_raw_temperature(struct.unpack_from("<H", p, 19)[0]),
+        "ctrl_type": p[21],
+        "ctrl_serial": bytes(p[22:34]),
+        "app_mode": bool(flags & 0x01),
+        "ctrl_connected": bool(flags & 0x02),
+        "lid_open": bool(flags & 0x04),
+        "fixed_speed": bool(flags & 0x08),
+        "fan_state": p[35],
+        "fan_duty": p[36],
+        "controller_state": p[47],
+        "reached_setpoint": bool(p[50] & 0x01),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Probe temperatures / virtual core
+# ---------------------------------------------------------------------------
+
+def unpack_probe_temps(raw):
+    """13 bytes -> 8 thermistor temps (C). LSB-first 13-bit packing, 0.05 C."""
+    out = []
+    n = len(raw)
+    for i in range(8):
+        bit = 13 * i
+        b = bit >> 3
+        v = raw[b]
+        if b + 1 < n:
+            v |= raw[b + 1] << 8
+        if b + 2 < n:
+            v |= raw[b + 2] << 16
+        out.append(((v >> (bit & 7)) & 0x1FFF) * 0.05 - 20.0)
+    return out
+
+
+def decode_probe(raw13, mode_byte, status_byte):
+    """Decode probe temps + virtual sensors. Core/surface/ambient are None
+    when the probe is not in Normal mode (e.g. Instant Read)."""
+    temps = unpack_probe_temps(raw13)
+    mode = mode_byte & 0x03
+    vs = (status_byte & 0xFE) >> 1
+    core_i = vs & 0x07          # 0..5 -> T1..T6
+    surf_i = 3 + ((vs >> 3) & 0x03)   # T4..T7
+    amb_i = 4 + ((vs >> 5) & 0x03)    # T5..T8
+    ok = mode == PROBE_MODE_NORMAL and core_i <= 5
+    return {
+        "mode": mode,
+        "temps": temps,
+        "core_sensor": core_i + 1,
+        "core_c": temps[core_i] if ok else None,
+        "surface_c": temps[surf_i] if ok else None,
+        "ambient_c": temps[amb_i] if ok else None,
+        "low_battery": bool(status_byte & 0x01),
+    }
+
+
+def parse_probe_advert(body):
+    """Probe (type 1) or repeated-probe node (type 2) advert body ->
+    (serial4, decoded) or None."""
+    if len(body) < 20 or body[0] not in (PRODUCT_TYPE_PROBE, PRODUCT_TYPE_NODE):
+        return None
+    serial = bytes(body[1:5])
+    if serial == b"\x00\x00\x00\x00":   # a repeater with no probe connected
+        return None
+    return serial, decode_probe(body[5:18], body[18], body[19])
+
+
+def parse_node_probe_status(payload):
+    """Node Probe Status (0x45) payload -> (serial4, decoded) or None.
+    Layout: serial(4) logrange(8) rawtemp(13) mode/id(1) battery+vs(1) ..."""
+    if len(payload) < 27:
+        return None
+    return bytes(payload[0:4]), decode_probe(payload[12:25], payload[25],
+                                             payload[26])
+
+
+def probe_serial_str(serial4):
+    """Render a 4-byte little-endian probe serial the way the app does."""
+    return "%08X" % (serial4[0] | serial4[1] << 8 | serial4[2] << 16
+                     | serial4[3] << 24)
+
+
+# ---------------------------------------------------------------------------
+# UART stream framing (for data received from another node, e.g. the Engine)
+# ---------------------------------------------------------------------------
+
+def split_frames(buf):
+    """Pull complete, CRC-valid frames out of a UART byte stream.
+
+    Returns (frames, remainder). Each frame is a tuple
+    (is_response, msg_type, request_id, success, payload). Garbage and
+    CRC failures are skipped by resynchronising on the next sync bytes.
+    """
+    buf = bytes(buf)
+    frames = []
+    i = 0
+    n = len(buf)
+    while True:
+        i = buf.find(SYNC_BYTES, i)
+        if i < 0:
+            # keep a trailing 0xCA in case it's the first half of a sync
+            return frames, (buf[-1:] if n and buf[-1] == 0xCA else b"")
+        if i + 5 > n:
+            return frames, buf[i:]
+        mtype = buf[i + 4]
+        is_resp = bool(mtype & RESPONSE_FLAG)
+        hdr = 15 if is_resp else 10
+        if i + hdr > n:
+            return frames, buf[i:]
+        length = buf[i + hdr - 1]
+        end = i + hdr + length
+        if end > n:
+            return frames, buf[i:]
+        crc = buf[i + 2] | buf[i + 3] << 8
+        if crc16_ccitt(buf[i + 4:end]) != crc:
+            i += 1          # bad frame: resync past this sync byte
+            continue
+        req_id = struct.unpack_from("<I", buf, i + 5)[0]
+        success = bool(buf[i + 13]) if is_resp else True
+        frames.append((is_resp, mtype & 0x7F, req_id, success,
+                       buf[i + hdr:end]))
+        i = end

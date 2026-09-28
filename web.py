@@ -129,11 +129,14 @@ button.warn{background:#a33}
 small{color:#9aa0a6}
 .ut{color:#9aa0a6;text-decoration:none;padding:2px 9px;border-radius:6px;border:1px solid #333a44;font-size:13px}
 .ut.active{background:#2b6cff;color:#fff;border-color:#2b6cff}
+.st{display:grid;grid-template-columns:1.3fr .8fr .8fr 1.3fr auto;gap:6px;align-items:end;margin-top:8px}
+.st small{display:block;font-size:11px;white-space:nowrap;overflow:hidden}
+.st button{margin-top:0;padding:9px 12px}
 </style></head><body><div class="wrap">
 <h1>Anova Oven &rarr; Combustion Relay</h1>
 <small>http://__MDNS__.local/</small>
 <div class="card">
-  <div>Gauge temperature
+  <div>Oven temperature
     <span style="float:right">
       <a href="#" id="uc" class="ut active" onclick="setUnit('c');return false">&deg;C</a>
       <a href="#" id="uf" class="ut" onclick="setUnit('f');return false">&deg;F</a>
@@ -152,6 +155,49 @@ small{color:#9aa0a6}
     <b>IP</b><span id="ip">--</span>
     <b>Free heap</b><span id="heap">--</span>
     <b>Uptime</b><span id="uptime">--</span>
+  </div>
+</div>
+
+<h2>Combustion Engine</h2>
+<div class="card">
+  <div class="grid">
+    <b>Engine</b><span id="eng">--</span>
+    <b>Set point</b><span id="esp">--</span>
+    <b>Pit temp</b><span id="ectl">--</span>
+    <b>Link</b><span id="elink">--</span>
+    <b>Last change</b><span id="eres">--</span>
+    <b>Oven &rarr; Engine</b><span id="efeed">--</span>
+    <b>Probe core</b><span id="eprobes">--</span>
+  </div>
+  <label>Set the Engine now <span class="u">&deg;C</span></label>
+  <div class="row"><input type="number" step="1" id="espin">
+    <button type="button" class="sec" onclick="setEngine()">Set</button></div>
+</div>
+
+<h2>Cook profile</h2>
+<div class="card">
+  <div id="runbox">No profile running.</div>
+  <div id="runidle" class="row" style="margin-top:8px">
+    <select id="psel" style="flex:1;padding:9px;border-radius:7px;background:#0f1114;color:#e8eaed;border:1px solid #333a44"></select>
+    <button type="button" onclick="runAct('start')">Start</button></div>
+  <div id="runbusy" style="display:none">
+    <button type="button" class="sec" onclick="runAct('skip')">Next stage now</button>
+    <button type="button" class="warn" onclick="if(confirm('Stop the running profile?'))runAct('stop')">Stop</button></div>
+  <small id="runerr" style="color:#e06666"></small>
+</div>
+
+<h2>Profiles</h2>
+<div class="card">
+  <small>Each stage sets the Engine, then moves on when <i>any</i> of its triggers fire: minutes in the stage, or the probe's virtual core temperature. Leave both blank to hold.</small>
+  <div id="plist" style="margin-top:8px"></div>
+  <button type="button" class="sec" onclick="editProfile(null)">New profile</button>
+  <div id="editor" style="display:none;margin-top:12px;border-top:1px solid #2a2e35;padding-top:8px">
+    <label>Profile name</label><input type="text" id="pname" maxlength="40">
+    <div id="stagebox"></div>
+    <button type="button" class="sec" onclick="addStage()">Add stage</button>
+    <button type="button" onclick="saveProfile()">Save profile</button>
+    <button type="button" class="sec" onclick="closeEditor()">Cancel</button>
+    <div><small id="ederr" style="color:#e06666"></small></div>
   </div>
 </div>
 
@@ -231,6 +277,7 @@ function renderBoxes(){
   });
 }
 function setUnit(u){
+  var ed=editor.style.display=='block'?readStages():null;
   unit=u;localStorage.setItem('unit',u);
   uc.className='ut'+(u=='c'?' active':'');
   uf.className='ut'+(u=='f'?' active':'');
@@ -238,6 +285,9 @@ function setUnit(u){
   for(var i=0;i<us.length;i++)us[i].innerHTML=(u=='f'?'&deg;F':'&deg;C');
   gunit.innerHTML=(u=='f'?'&deg;F':'&deg;C');
   renderBig();renderBoxes();
+  if(ed)renderStages(ed);
+  renderProfiles();
+  if(lastS){updEngine(lastS);updRun(lastS);}
 }
 function initBoxes(){
   ['temp','high','low'].forEach(function(n){
@@ -256,7 +306,116 @@ function initBoxes(){
     });
   });
 }
+// ---- Engine + cook profiles (temps are Celsius on the wire) ----
+var DEG=String.fromCharCode(176);
+var lastS=null,profs=[],edIdx=null;
+function toU(c){return unit=='f'?c*9/5+32:c;}
+function fromU(v){return unit=='f'?(v-32)*5/9:v;}
+function fmtT(c){return c==null?'--':toU(c).toFixed(1)+' '+DEG+(unit=='f'?'F':'C');}
+function fmtMin(m){if(m==null)return '--';m=Math.round(m);var h=Math.floor(m/60);return h?h+'h '+(m%60)+'m':m+'m';}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+function post(url,obj){return fetch(url,{method:'POST',body:JSON.stringify(obj)}).then(function(r){return r.json();});}
+function stageText(st){
+  var t=[];
+  if(st.after_min!=null)t.push(fmtMin(st.after_min));
+  if(st.core_at!=null)t.push('core '+fmtT(st.core_at));
+  return fmtT(st.setpoint)+(t.length?' until '+t.join(' or '):' (hold)');
+}
+function updEngine(s){
+  var e=s.engine;
+  if(!e){eng.textContent='disabled (engine_enabled is false)';return;}
+  eng.textContent=e.found?(e.serial+' ('+e.rssi+' dBm, '+e.age_s+'s ago)'+(e.app_mode===false?' - NOT in App Mode':'')+(e.lid_open?' - lid open':'')):'searching...';
+  esp.textContent=fmtT(e.setpoint_c)+(e.pending!=null?' - sending '+fmtT(e.pending):'');
+  ectl.textContent=e.control_c!=null?fmtT(e.control_c)+(e.fan_duty!=null?' (fan duty '+e.fan_duty+')':''):'-- (while linked)';
+  elink.textContent=e.link;
+  eres.textContent=e.result||'--';
+  efeed.textContent=e.feeding?('streaming ('+e.fed+' sent), Engine '+(e.ctrl_connected?'sees it':'not seeing it yet')):
+    (e.ctrl_is_us===false?'not used (Engine control device: '+(e.ctrl_device||'?')+')':(s.broadcasting?'idle':'paused (gauge not broadcasting)'));
+  var ps=s.probes||[];
+  eprobes.textContent=ps.length?ps.map(function(p){return p.serial+': '+(p.core_c==null?'no core (instant read?)':fmtT(p.core_c))+' ('+p.src+', '+p.age_s+'s)';}).join(', '):'no probes heard';
+}
+function updRun(s){
+  var r=s.run;
+  if(!r){runbox.textContent='Engine control disabled.';runidle.style.display='none';return;}
+  runidle.style.display=r.running?'none':'flex';
+  runbusy.style.display=r.running?'block':'none';
+  if(!r.running){runbox.textContent='No profile running.';return;}
+  var h='<b>'+esc(r.name)+'</b> - stage '+r.stage+' of '+r.stages.length+', '+fmtMin(r.stage_min)+' in stage ('+fmtMin(r.total_min)+' total)';
+  h+='<br>Probe '+(r.probe||'(auto)')+' core: '+fmtT(r.core_c);
+  if(r.note)h+='<br><small>'+esc(r.note)+'</small>';
+  h+='<ol style="margin:6px 0 0;padding-left:22px">';
+  r.stages.forEach(function(st,i){
+    var cur=(i+1==r.stage),sty=cur?' style="color:#5fd873;font-weight:600"':(i+1<r.stage?' style="color:#6b7078"':'');
+    h+='<li'+sty+'>'+stageText(st)+(cur&&!r.applied?' (setting Engine)':'')+(cur&&r.override?' (changed elsewhere)':'')+'</li>';
+  });
+  runbox.innerHTML=h+'</ol>';
+}
+function loadProfiles(){fetch('/api/profiles').then(function(r){return r.json();}).then(function(j){if(j.ok){profs=j.profiles;renderProfiles();}}).catch(function(){});}
+function renderProfiles(){
+  var h='';
+  profs.forEach(function(p,i){
+    h+='<div style="padding:6px 0;border-bottom:1px solid #2a2e35"><b>'+esc(p.name)+'</b> <a href="#" class="ut" onclick="editProfile('+i+');return false">edit</a> <a href="#" class="ut" onclick="delProfile('+i+');return false">delete</a><br><small>'+p.stages.map(stageText).join(' / ')+'</small></div>';
+  });
+  plist.innerHTML=h||'<small>No profiles yet.</small>';
+  var sel=psel.value;
+  psel.innerHTML=profs.map(function(p){return '<option>'+esc(p.name)+'</option>';}).join('');
+  if(sel)psel.value=sel;
+}
+function stageRow(st){
+  var d=document.createElement('div');d.className='st';
+  var U=DEG+(unit=='f'?'F':'C');
+  function inp(label,v,cls){
+    var w=document.createElement('div'),l=document.createElement('small'),i=document.createElement('input');
+    l.textContent=label;i.type='number';i.step='any';i.className=cls;i.value=(v==null?'':v);
+    w.appendChild(l);w.appendChild(i);d.appendChild(w);
+  }
+  inp('Set point '+U,st.setpoint==null?null:r1(toU(st.setpoint)),'s-sp');
+  var am=st.after_min;
+  inp('After (h)',am==null?null:Math.floor(am/60),'s-ah');
+  inp('+ min',am==null?null:r1(am-Math.floor(am/60)*60),'s-am');
+  inp('or core at '+U,st.core_at==null?null:r1(toU(st.core_at)),'s-ca');
+  var b=document.createElement('button');b.type='button';b.className='sec';b.textContent='x';
+  b.onclick=function(){d.remove();};d.appendChild(b);
+  return d;
+}
+function renderStages(list){stagebox.innerHTML='';list.forEach(function(st){stagebox.appendChild(stageRow(st));});}
+function readStages(){
+  var out=[],rows=stagebox.querySelectorAll('.st');
+  for(var k=0;k<rows.length;k++){
+    var row=rows[k];
+    var q=function(c){var v=row.querySelector('.'+c).value;return v===''?null:parseFloat(v);};
+    var sp=q('s-sp'),ah=q('s-ah'),am=q('s-am'),ca=q('s-ca');
+    am=(ah==null&&am==null)?null:r1((ah||0)*60+(am||0));
+    out.push({setpoint:sp==null?null:r1(fromU(sp)),after_min:am,core_at:ca==null?null:r1(fromU(ca))});
+  }
+  return out;
+}
+function editProfile(i){
+  edIdx=i;var p=(i==null)?{name:'',stages:[{setpoint:110}]}:profs[i];
+  pname.value=p.name;renderStages(p.stages);editor.style.display='block';ederr.textContent='';
+}
+function addStage(){stagebox.appendChild(stageRow({}));}
+function closeEditor(){editor.style.display='none';edIdx=null;}
+function saveProfile(){
+  var p={name:pname.value.trim(),stages:readStages()};
+  post('/api/profiles',{profile:p,old_name:edIdx==null?null:profs[edIdx].name}).then(function(j){
+    if(!j.ok){ederr.textContent=j.error;return;}
+    profs=j.profiles;renderProfiles();closeEditor();});
+}
+function delProfile(i){
+  if(!confirm('Delete profile '+profs[i].name+'?'))return;
+  post('/api/profiles/delete',{name:profs[i].name}).then(function(j){if(j.ok){profs=j.profiles;renderProfiles();}});
+}
+function runAct(a){
+  runerr.textContent='';
+  post('/api/run',{action:a,name:psel.value}).then(function(j){if(!j.ok)runerr.textContent=j.error;});
+}
+function setEngine(){
+  var v=parseFloat(espin.value);if(isNaN(v))return;
+  post('/api/engine/setpoint',{c:r1(fromU(v))}).then(function(j){eres.textContent=j.ok?'sending...':j.error;});
+}
 function upd(s){
+  lastS=s;updEngine(s);updRun(s);
   lastGauge=s.gauge_temp;renderBig();
   oven.textContent=s.oven_temp==null?'--':s.oven_temp.toFixed(2)+' C';
   mode.textContent=s.mode;bstatus.textContent=s.bridge;
@@ -288,6 +447,7 @@ function connectWS(){
   }catch(e){conn.textContent='polling';setTimeout(connectWS,3000);}
 }
 connectWS();
+loadProfiles();
 async function poll(){ if(wsok)return; try{let r=await fetch('/status');upd(await r.json());}catch(e){} }
 setInterval(poll,3000);
 </script>
@@ -300,10 +460,13 @@ def _esc(v):
 
 class WebUI:
     def __init__(self, gauge, oven, transport, cfg, cfg_path="config.json",
-                 log_state=None):
+                 log_state=None, engine=None, runner=None, store=None):
         self.gauge = gauge
         self.oven = oven
         self.transport = transport
+        self.engine = engine
+        self.runner = runner
+        self.store = store
         self.cfg = cfg
         self.cfg_path = cfg_path
         self.log = log_state or {"seq": 0, "lines": []}
@@ -355,6 +518,20 @@ class WebUI:
         return html
 
     def _status(self):
+        d = self._base_status()
+        if self.engine:
+            import protocol
+            d["engine"] = self.engine.status()
+            d["probes"] = [
+                {"serial": protocol.probe_serial_str(s), "core_c": r["core_c"],
+                 "surface_c": r["surface_c"], "ambient_c": r["ambient_c"],
+                 "age_s": r["age_ms"] // 1000, "src": r["src"]}
+                for s, r in self.engine.probe_readings().items()]
+        if self.runner:
+            d["run"] = self.runner.status()
+        return d
+
+    def _base_status(self):
         return {
             "gauge_temp": self.gauge.temperature_c,
             "oven_temp": self.oven["celsius"],
@@ -375,8 +552,8 @@ class WebUI:
             "scanning": self.transport._scanning,
             "central_state": self.transport.central_state,
             "probe_frames": self.transport.probe_frame_count,
-            "probe_handles": [self.transport._probe_tx, self.transport._probe_rx,
-                              self.transport._probe_cccd],
+            "probe_handles": [self.transport.probe_link.notify_h,
+                              self.transport.probe_link.cccd],
             "probe_last_len": (len(self.transport.probe_frames[-1])
                                if self.transport.probe_frames else 0),
             "heap": _free_heap(),
@@ -444,6 +621,12 @@ class WebUI:
             if path == "/status":
                 self._send(writer, "200 OK", "application/json",
                            json.dumps(self._status()))
+            elif path.startswith("/api/"):
+                try:
+                    res = self._api(method, path, json.loads(body) if body else {})
+                except Exception as exc:
+                    res = {"ok": False, "error": str(exc)}
+                self._send(writer, "200 OK", "application/json", json.dumps(res))
             elif method == "POST" and path == "/control":
                 self._apply_control(_parse_form(body))
                 self._redirect(writer)
@@ -479,6 +662,41 @@ class WebUI:
     def _redirect(self, writer):
         writer.write(b"HTTP/1.0 303 See Other\r\nLocation: /\r\n"
                      b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+
+    # -- JSON API (Engine + cook profiles) -----------------------------------
+
+    def _api(self, method, path, req):
+        if not (self.engine and self.runner and self.store):
+            return {"ok": False, "error": "Engine control is disabled"}
+        if path == "/api/profiles" and method == "GET":
+            return {"ok": True, "profiles": self.store.profiles}
+        if method != "POST":
+            return {"ok": False, "error": "use POST"}
+        err = None
+        if path == "/api/profiles":
+            self.store.put(req.get("profile"), req.get("old_name"))
+            return {"ok": True, "profiles": self.store.profiles}
+        if path == "/api/profiles/delete":
+            self.store.delete(req.get("name"))
+            return {"ok": True, "profiles": self.store.profiles}
+        if path == "/api/run":
+            action = req.get("action")
+            if action == "start":
+                p = self.store.get(req.get("name"))
+                err = self.runner.start(p, req.get("probe")) if p else "no such profile"
+            elif action == "stop":
+                self.runner.stop()
+            elif action == "skip":
+                self.runner.skip()
+            else:
+                err = "unknown action"
+        elif path == "/api/engine/peek":
+            err = self.engine.peek()
+        elif path == "/api/engine/setpoint":
+            err = self.engine.request_setpoint(float(req.get("c")), "web UI")
+        else:
+            err = "not found"
+        return {"ok": err is None, "error": err}
 
     # -- actions ------------------------------------------------------------
 

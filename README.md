@@ -3,8 +3,27 @@
 Bridges an Anova Precision Oven's live temperature into the Combustion app by
 presenting as a Combustion Gauge-class node over BLE. 
 
+<img src="docs/screenshots/status.png" alt="Web UI: live oven temperature and relay status" width="420" align="right">
+
+What it does:
+
+- **Virtual gauge:** the oven's temperature (wet bulb in sous-vide mode, dry
+  bulb otherwise, from the official Anova API) shows up in the Combustion
+  app as a Gauge.
+- **Oven as the Engine's control device:** pick the virtual gauge in the
+  Combustion app and a Combustion **Engine** regulates to the oven's
+  temperature.
+- **Engine cook profiles:** multi-stage set point changes triggered by time
+  and/or the probe's virtual core temperature (e.g. the built-in *Quicker
+  Pulled Pork*).
+- **MeatNet repeater:** relays nearby probes' advertisements, with an
+  optional probe connect proxy.
+- **Web UI** at `http://anovarelay.local/` with live status, logs and °C/°F.
 
 The gauge serial is derived from the chip MAC.
+
+<br clear="right">
+
 
 
 ## Setup instructions
@@ -65,17 +84,23 @@ holds your WiFi password and Anova token.
   "follow_oven": true,
   "broadcast_mode": "always",
   "broadcast_grace_min": 10,
-  "relay_probes": false,
-  "relay_connect": false
+  "relay_probes": "oven",
+  "relay_connect": false,
+  "engine_enabled": true,
+  "engine_serial": "",
+  "profile_probe": ""
 }
 ```
+
+`engine_serial` / `profile_probe` are optional pins (leave blank to use the
+nearest Engine and whichever probe is reporting a core temperature).
 
 ### 6. Deploy the code
 
 From the repo directory, copy **all** the modules plus your config to the board:
 
 ```
-python -m mpremote connect <PORT> fs cp protocol.py gauge.py ble.py anova.py web.py main.py config.json :
+python -m mpremote connect <PORT> fs cp protocol.py gauge.py central.py ble.py engine.py profiles.py anova.py web.py main.py config.json :
 ```
 
 ### 7. First run
@@ -96,11 +121,15 @@ on the serial console: `[web] config UI at ...`).
 |---|---|
 | `protocol.py` | Wire formats |
 | `gauge.py` | Device state machine: logs, alarms, request handling |
-| `ble.py` | BLE transport: advertising set + NUS GATT server, MeatNet relay + central-role probe link (low-level `bluetooth` API) |
+| `ble.py` | BLE transport: advertising set + NUS GATT server, MeatNet relay, passive scan of Engines/probes (low-level `bluetooth` API) |
+| `central.py` | Reusable BLE central link (connect → discover → notify → write), used for the probe proxy and the Engine |
+| `engine.py` | Combustion Engine control: set point changes with confirm/retry, probe virtual-core readings |
+| `profiles.py` | Cook profiles (`profiles.json`) and the stage runner (`run.json`, resumes after reboot) |
 | `anova.py` | Anova cloud client (WebSocket over TLS), runs in its own thread |
 | `web.py` | Web UI: HTTP + WebSocket server (status/log stream, config, control) |
-| `main.py` | Auto-starting console + 1 Hz tick/notify loop; wires everything together |
+| `main.py` | Auto-starting console, 1 Hz tick/notify loop and 10 Hz BLE link loop; wires everything together |
 | `config.json` | WiFi, Anova PAT, and feature settings (deployed to the board) |
+| `docs/screenshots/` | Web UI screenshots used in this README |
 
 
 
@@ -110,14 +139,91 @@ When WiFi is up, the device serves a config/control panel on port 80 —
 open `http://anovarelay.local/` from any browser or phone on the same network
 (the IP is printed on the serial console at boot: `[web] config UI at ...`).
 
-- **Live status + log** 
+- **Live status + log** over a WebSocket, with a °C/°F toggle.
+- **Combustion Engine**: the Engine's set point, pit temperature, App Mode,
+  whether the oven is feeding it, and nearby probes' core temperatures;
+  set the Engine directly.
+- **Cook profile / Profiles**: start, skip and stop runs; create and edit
+  profiles.
 - **Control** follow-oven toggle, manual temperature,
-  sensor-present / low-battery / overheating flags, high/low alarms, and
-  **broadcast mode**.
+  sensor-present / low-battery / overheating flags, high/low alarms,
+  **broadcast mode** and the **MeatNet relay** mode.
 - **Configuration** (saved to `config.json`; reboot to apply): WiFi
   credentials, gauge serial, Anova Personal Access Token, mDNS hostname,
   follow-on-boot. "Save & reboot" persists and restarts the device.
 
+
+### Using the oven as the Engine's control device
+
+In the Combustion app you can pick the relay's virtual gauge as the Engine's
+control device, so the Engine regulates to the **oven's** temperature. A real
+Gauge does this by connecting *out* to the Engine and pushing its Gauge
+Status (0x60) over MeatNet UART; the Engine never connects to the gauge.
+The relay does the same:
+
+- It's automatic: the relay checks the Engine's control device, and while
+  it's this gauge, holds a link to the Engine and sends the gauge status
+  every second. Choose another control device in the app to stop it. The
+  web UI's "Oven → Engine" line shows what it's doing.
+- It only streams while the gauge is broadcasting. In "only while oven is
+  on" broadcast mode, the Engine shows its control device as disconnected
+  once the oven is off and the grace period ends.
+
+⚠️ The Engine drives its fan toward the set point using this temperature.
+If the oven is cold and the set point is high, the fan runs flat out.
+
+<img src="docs/screenshots/engine.png" alt="Web UI: Combustion Engine card" width="520">
+
+### Combustion Engine cook profiles
+
+The relay can drive a **Combustion Engine**'s set point through a multi-stage
+cook profile. Each stage sets the Engine, then moves on when **any** of its
+triggers fires:
+
+- **After (h + min)**: time since the Engine took that stage's set point
+- **Core at**: the probe's *virtual core* temperature reaches a value
+
+A stage with no triggers holds indefinitely (use one as the final stage). If
+the last stage has a trigger, the run ends when it fires and the Engine keeps
+that set point.
+
+The built-in **Quicker Pulled Pork** profile (hot-and-fast pork shoulder,
+roughly 6–8 h instead of 12+ at 107 °C / 225 °F):
+
+| Stage | Pit | Moves on when | Why |
+|---|---|---|---|
+| 1 | 121 °C / 250 °F | core 60 °C / 140 °F (or 3 h) | Smoke is absorbed (and the smoke ring forms) only while the meat is below ~60 °C, so this part stays low |
+| 2 | 149 °C / 300 °F | core 71 °C / 160 °F (or 2.5 h) | Sets the bark quickly |
+| 3 | 149 °C / 300 °F | core 95 °C / 203 °F (or 5 h) | **Wrap in butcher paper when this stage starts** (keeps the bark crisper than foil), then push through the stall to probe-tender |
+| 4 | 77 °C / 170 °F | holds | Rest/hold; a long rest makes it pull better |
+
+The time limits are only backstops in case the probe drops out.
+
+Create, edit, start, skip and stop profiles in the web UI's **Cook profile /
+Profiles** sections (°C/°F follows the page toggle):
+
+<img src="docs/screenshots/profiles.png" alt="Web UI: cook profile runner and profile editor" width="520">
+
+How it works:
+
+- **The Engine must be in App Mode.** It only accepts set point changes from
+  an app in that mode. The UI flags it if it isn't.
+- The Engine's set point and the probe's core temperature are read
+  **passively from BLE advertisements** (the probe's own, or repeated by the
+  Engine/other nodes). Unless the oven is the Engine's control device (see
+  above), the relay only connects to the Engine while it's changing the set
+  point, then disconnects after ~15 s, so it doesn't hold one of the
+  Engine's connection slots or the probe's.
+- Changes are sent the way the official app does it: send, re-send every 5 s,
+  and confirm by watching the Engine report the new set point. If it fails
+  (Engine off, out of range, not in App Mode), the runner retries every 60 s.
+- **It doesn't fight you.** If the set point is changed elsewhere (Combustion
+  app, Engine knob), the runner leaves it alone until the next stage starts.
+- The clock is synced by NTP after WiFi connects, and the active run is saved
+  to `run.json`, so a reboot or power blip resumes at the same stage and time.
+  A profile can't start until the clock has synced.
+- Profiles are stored on the board in `profiles.json`, which is created with
+  the Quicker Pulled Pork profile on first boot.
 
 ### Broadcast mode
 
@@ -131,8 +237,8 @@ open `http://anovarelay.local/` from any browser or phone on the same network
 
 ### MeatNet probe relay
 
-Optional (toggle in the web UI Control section, persisted as `relay_probes`).
-When on, the device scans for nearby Combustion **probes** advertising
+Set in the web UI Control section (persisted as `relay_probes`): **Off**,
+**On**, or **Only while oven is on** (default). When active, the device scans for nearby Combustion **probes** advertising
 directly (product type 1) and re-broadcasts each one as a repeated MeatNet
 **node** advertisement (product type 2) with the hop-count byte set, so the
 probe's live temperature reaches the app *through* this relay when the probe
